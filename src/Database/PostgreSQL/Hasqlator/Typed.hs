@@ -220,59 +220,24 @@ castTo :: H.QueryBuilder
        -> Expression nullable a
 castTo tp e = Expression $ H.fun "cast" [exprBuilder e `H.as` tp]
 
-instance Castable StrictBS.ByteString where
-  cast = castTo "BINARY"
-
-instance Castable Text where
-  cast = castTo "CHAR UNICODE"
-
-instance Castable Day where
-  cast = castTo "DATE"
-
-instance Castable LocalTime where
-  cast = castTo "DATETIME"
-
-instance Castable Scientific where
-  cast = castTo "DECIMAL"
+instance Castable Float where
+  cast = castTo "real"
 
 instance Castable Double where
-  cast = castTo "FLOAT[53]"
+  cast = castTo "double precision"
 
 instance Castable Int where
-  cast = castTo "SIGNED"
-
-instance Castable Int8 where
-  cast = castTo "SIGNED"
+  cast = castTo "bigint"
 
 instance Castable Int16 where
-  cast = castTo "SIGNED"
+  cast = castTo "smallint"
 
 instance Castable Int32 where
-  cast = castTo "SIGNED"
+  cast = castTo "integer"
 
 instance Castable Int64 where
-  cast = castTo "SIGNED"
+  cast = castTo "bigint"
 
-instance Castable TimeOfDay where
-  cast = castTo "TIME"
-
-instance Castable DiffTime where
-  cast = castTo "TIME"
-
-instance Castable Word where
-  cast = castTo "UNSIGNED"
-
-instance Castable Word8 where
-  cast = castTo "UNSIGNED"
-
-instance Castable Word16 where
-  cast = castTo "UNSIGNED"
-
-instance Castable Word32 where
-  cast = castTo "UNSIGNED"
-
-instance Castable Word64 where
-  cast = castTo "UNSIGNED"
 
 -- | Cast the return type of an expression to any other type, without
 -- changing the query. Since this library adds static typing on top of
@@ -327,11 +292,6 @@ insertData = contramap from' . insertDataGeneric . from'
 skipInsert :: Insertor tbl db a
 skipInsert = mempty
 
-{-
-personInsertor :: Insertor table database Person
-personInsertor = insertData (name, age)
--}
-
 into :: Insertable fieldNull fieldType b
      => (a -> b)
      -> Field table database fieldNull fieldType
@@ -350,37 +310,3 @@ insertValues :: Table table database
              -> H.Command
 insertValues (Table tableName) (Insertor i) =
   H.insertValues (H.rawSql tableName) i
-
-{-
-
-data SqoDb
-
-id_ :: Field "Interventions" SqoDb 'NotNull String
-id_ = Field "id" "Interventions"
-
-data sqlInterventionOverviewTables = sqlInterventionOverviewTables {
-  intervention :: TableAlias SqoDb InterventionTabel
-  
-  }
-
-sqlInterventionOverview = do
-  i <- from intervention
-  od <- join objectDomain $ \od -> od@@uuid .= i@@objectUuid
-  p <- join plant $ \p -> p@@uuid .= od@@domain_object_uuid
-  upc <- join userPlantCache $ \upc -> upc@@plantId .= p@@id_
-  io <- leftJoin identityObject $ \io -> io@name .= i@assignee_key
-  for_ mbUserId $ \userId ->
-    where_ $ user_id .= io@@userId
-  let sqlInterventionOverviewSelector = do
-     id_ <- col ( i@@id_)
-     leoId <- col $ i@@interventionNumber
-       ref <- ("interventions/" <>) <$> col i@@interventionNumber
-     objectUuid <- col $ 
-       (case_ (field inverterObjectType)
-         [ ("PLANT", "plants/")
-         , ("INVERTER", "inverters/")
-         , ("LOGGER", "loggers/") ]
-         , inverterObjectUuid ])
-     pure $ Intervention {id_, leoId, ref, objectUuid}
-  pure ((i, od, p), sqlInterventionOverviewSelector)
--}
