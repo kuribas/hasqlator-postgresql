@@ -9,31 +9,39 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE TupleSections #-}
 
 module Database.PostgreSQL.Hasqlator.Typed
   ( -- * Database Types
-    Table(..), Field(..), TableAlias, Nullable (..),
+    Table(..), Field(..), Tbl(..), (@@), Nullable (..),
     
     
     -- * Querying
     Query, 
 
     -- * Selectors
-    H.Selector, col, colMaybe,
+    H.Selector, sel, selMaybe,
+
     -- * Expressions
-    Expression, Operator, 
-    arg, argMaybe, (@@), nullable, cast, unsafeCast,
+    Expression, SomeExpression, someExpr, Operator,
+    subQueryExpr, arg, argMaybe, nullable, cast, unsafeCast,
     op, fun1, fun2, fun3, (>.), (<.), (>=.), (<=.), (&&.), (||.), 
 
+    -- * Clauses
+    from, fromSubQuery, innerJoin, leftJoin, joinSubQuery, leftJoinSubQuery,
+    where_, groupBy_, having, orderBy, limit, limitOffset,
+
     -- * Insertion
-    Insertor, insertValues, into, lensInto,
-    insertOne,
+    Insertor, insertValues, insertSelect, insertData, skipInsert, into,
+    lensInto, insertOne, exprInto, Into,
     
     -- * imported from Database.PostgreSQL.Hasqlator
     H.Getter, H.ToSql, H.FromSql
   )
 where
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Coerce
 import qualified Data.ByteString as StrictBS
 import Data.Scientific
@@ -41,13 +49,17 @@ import Data.Word
 import Data.Int
 import Data.Time
 import Data.String
+import qualified Data.DList  as DList
 import qualified Data.Map.Strict as Map
 import Control.Monad.State
+import Control.Monad.Reader
 import GHC.Exts (Constraint)
 import GHC.TypeLits as TL
 import Data.Functor.Contravariant
-import GHC.Generics
-
+import Control.Applicative
+import qualified GHC.Generics as Generics (from, to)
+import GHC.Generics hiding (from, Selector)
+import Data.Proxy
 import qualified Database.PostgreSQL.Hasqlator as H
 
 data Nullable = Nullable | NotNull
@@ -70,24 +82,37 @@ type Insertable nullable field a =
   (CheckInsertable nullable field a, H.ToSql a)
 
 -- | check if field can be used in nullable context
-type family CheckFieldNullable (leftJoined :: JoinType) (field :: Nullable)
-  (context :: Nullable) :: Constraint
+type family CheckExprNullable (expr :: Nullable) (context :: Nullable)
+     :: Constraint
   where
-    CheckFieldNullable 'InnerJoined 'Nullable 'Nullable = ()
-    CheckFieldNullable _ 'Nullable 'NotNull =
-      TypeError ('Text "A nullable field can be only used in a nullable context")
-    -- a NotNull field can be used in both contexts
-    CheckFieldNullable 'InnerJoined 'NotNull _ = ()
-    -- any field can be used in a nullable context
-    CheckFieldNullable 'LeftJoined _ 'Nullable = ()
-    CheckFieldNullable 'LeftJoined _ 'NotNull =
-      TypeError ('Text "A field from a left joined table can be only used in a nullable context.")
+    CheckExprNullable 'Nullable 'Nullable = ()
+    CheckExprNullable 'Nullable 'NotNull =
+      TypeError ('Text "A nullable expression can be only used in a nullable context")
+    -- a NotNull expressions can be used in both contexts
+    CheckExprNullable 'NotNull _ = ()
+
+-- | check if a field is nullable after being joined
+type family JoinNullable (leftJoined :: JoinType) (field :: Nullable)
+     :: Nullable
+  where
+    JoinNullable 'InnerJoined nullable = nullable
+    JoinNullable 'LeftJoined _ = 'Nullable
 
 data Field table database (nullable :: Nullable) a =
   Field Text Text
  
 newtype Expression (nullable :: Nullable) a =
-  Expression { exprBuilder :: H.QueryBuilder }
+  Expression {runExpression :: QueryInner H.QueryBuilder }
+
+-- | An expression of any type
+newtype SomeExpression =
+  SomeExpression { runSomeExpression :: QueryInner H.QueryBuilder }
+
+newtype Selector a = Selector (QueryInner (H.Selector a))
+
+-- | Remove types of an expression
+someExpr :: Expression nullable a -> SomeExpression
+someExpr = coerce
 
 instance IsString (Expression nullable Text) where
   fromString = arg . fromString
@@ -113,87 +138,102 @@ instance (Fractional n, H.ToSql n)
   fromRational = arg . fromRational
   
 data Table table database = Table Text
-data TableAlias table database (joinType :: JoinType) =
-  TableAlias Text
+
+-- | An table alias that can be used inside the Query.  The function
+-- inside the newtype can also be applied directly to create an
+-- expression from a field.
+newtype Tbl table database (joinType :: JoinType) =
+  Tbl { getTableAlias ::
+          forall fieldNull exprNull a .
+          CheckExprNullable (JoinNullable joinType fieldNull) exprNull =>
+          Field table database fieldNull a ->
+          Expression exprNull a }
 
 newtype Insertor table database a = Insertor (H.Insertor a)
   deriving (Monoid, Semigroup, Contravariant)
 
-data ClauseState database = ClauseState
-  { clauses :: H.QueryClauses  -- clauses build so far
-  , aliases :: Map.Map Text Int   -- map of table names to times used
+data ClauseState = ClauseState
+  { clausesBuild :: H.QueryClauses  -- clauses build so far
+  , aliases :: Map.Map Text Int   -- map of aliases to times used
   }
 
-emptyClauseState :: ClauseState database
-emptyClauseState = ClauseState
-  { clauses = mempty
-  , aliases = Map.empty
-  }
+emptyClauseState :: ClauseState
+emptyClauseState = ClauseState mempty Map.empty
 
-newtype Query database a = Query (State (ClauseState database) a)
+type QueryInner a = State ClauseState a
+
+newtype Query database a = Query (QueryInner a)
   deriving (Functor, Applicative, Monad)
 
 instance H.ToQueryBuilder (Query database (H.Selector a)) where
   toQueryBuilder (Query query) =
     let (selector, clauseState) = runState query emptyClauseState
     -- TODO: finalize query
-    in H.toQueryBuilder $ H.select selector (clauses clauseState)
+    in H.toQueryBuilder $ H.select selector $ clausesBuild clauseState
 
 type Operator a b c = forall nullable .
                       (Expression nullable a ->
                        Expression nullable b ->
                        Expression nullable c)
 
--- | reference a field from a joined table
-(@@) :: CheckFieldNullable leftJoined fieldNull exprNull
-     => TableAlias table database leftJoined
+infixl 9 @@
+
+  -- | Create an expression from an aliased table and a field.
+(@@) :: CheckExprNullable (JoinNullable joinType fieldNull) exprNull
+     => Tbl table database (joinType :: JoinType)
      -> Field table database fieldNull a
      -> Expression exprNull a
-TableAlias tableName @@ Field _ fieldName =
-    Expression $ H.rawSql $ tableName <> "." <> fieldName
+(@@) = getTableAlias  
+ 
+mkTableAlias :: Text -> Tbl table database leftJoined
+mkTableAlias tableName = Tbl $ \(Field _ fieldName) ->
+  Expression $ pure $ H.rawSql $ tableName <> "." <> fieldName
+
+data QueryOrdering = Asc SomeExpression | Desc SomeExpression
 
 -- | make a selector from a column
-col :: H.FromSql a
+sel :: H.FromSql a
     => Expression 'NotNull a
-    -> H.Selector a
-col = coerce $ H.col . exprBuilder
+    -> Selector a
+sel (Expression expr) = Selector $ H.sel <$> expr
 
 -- | make a selector from a column that can be null
-colMaybe :: H.FromSql (Maybe a)
+selMaybe :: H.FromSql (Maybe a)
          => Expression 'Nullable a
-         -> H.Selector (Maybe a)
-colMaybe = coerce $ H.col . exprBuilder
+         -> Selector (Maybe a)
+selMaybe (Expression expr) = Selector $ H.sel <$> expr
 
 -- | pass an argument
 arg :: H.ToSql a => a -> Expression nullable a
-arg = Expression . H.arg
+arg x = Expression $ pure $ H.arg x
 
 -- | pass an argument which can be null
 argMaybe :: H.ToSql a => Maybe a -> Expression 'Nullable a
-argMaybe = Expression . H.arg
+argMaybe x = Expression $ pure $ H.arg x
 
 -- | create an operator
 op :: (H.QueryBuilder -> H.QueryBuilder -> H.QueryBuilder)
    -> Operator a b c
-op = coerce
+op = fun2
 
 fun1 :: (H.QueryBuilder -> H.QueryBuilder)
      -> Expression nullable a
      -> Expression nullable b
-fun1 = coerce
+fun1 f (Expression x) = Expression $ f <$> x
 
 fun2 :: (H.QueryBuilder -> H.QueryBuilder -> H.QueryBuilder)
      -> Expression nullable a
      -> Expression nullable b
      -> Expression nullable c
-fun2 = coerce
+fun2 f (Expression x1) (Expression x2) = Expression $ liftA2 f x1 x2
 
 fun3 :: (H.QueryBuilder -> H.QueryBuilder -> H.QueryBuilder -> H.QueryBuilder)
      -> Expression nullable a
      -> Expression nullable b
      -> Expression nullable c
      -> Expression nullable d
-fun3 = coerce
+fun3 f (Expression x1) (Expression x2) (Expression x3) =
+  Expression $ liftA3 f x1 x2 x3
 
 (>.), (<.), (>=.), (<=.) :: H.ToSql a => Operator a a Bool
 (>.) = op (H.>.)
@@ -218,7 +258,9 @@ class Castable a where
 castTo :: H.QueryBuilder
        -> Expression nullable b
        -> Expression nullable a
-castTo tp e = Expression $ H.fun "cast" [exprBuilder e `H.as` tp]
+castTo tp (Expression e) = Expression $ do
+  x <- e
+  pure $ H.fun "cast" [x `H.as` tp]
 
 instance Castable Float where
   cast = castTo "real"
@@ -267,13 +309,13 @@ class InsertGeneric table database (fields :: *) (data_ :: *) where
 
 instance (InsertGeneric tbl db (a ()) (c ()),
           InsertGeneric tbl db (b ()) (d ())) =>
-  InsertGeneric tbl db ((a :*: b) ()) ((c :*: d) ()) where
+         InsertGeneric tbl db ((a :*: b) ()) ((c :*: d) ()) where
   insertDataGeneric (a :*: b) =
     contramap genFst (insertDataGeneric a) <>
     contramap genSnd (insertDataGeneric b)
 
 instance InsertGeneric tbl db (a ()) (b ()) =>
-  InsertGeneric tbl db (M1 m1 m2 a ()) (M1 m3 m4 b ()) where
+         InsertGeneric tbl db (M1 m1 m2 a ()) (M1 m3 m4 b ()) where
   insertDataGeneric = contramap unM1 . insertDataGeneric . unM1
 
 instance Insertable fieldNull a b =>
@@ -287,15 +329,15 @@ insertData :: (Generic a, Generic b, InsertGeneric tbl db (Rep a ()) (Rep b ()))
            => a -> Insertor tbl db b
 insertData = contramap from' . insertDataGeneric . from'
   where from' :: Generic a => a -> Rep a ()
-        from' = from
+        from' = Generics.from
 
 skipInsert :: Insertor tbl db a
 skipInsert = mempty
 
 into :: Insertable fieldNull fieldType b
-     => (a -> b)
-     -> Field table database fieldNull fieldType
-     -> Insertor table database a
+        => (a -> b)
+        -> Field table database fieldNull fieldType
+        -> Insertor table database a
 into f = Insertor . H.into f . fieldText
 
 lensInto :: Insertable fieldNull fieldType b
@@ -310,3 +352,205 @@ insertValues :: Table table database
              -> H.Command
 insertValues (Table tableName) (Insertor i) =
   H.insertValues (H.rawSql tableName) i
+
+newAlias :: Text -> QueryInner Text
+newAlias prefix = do
+  clsState <- get
+  let newIndex = Map.findWithDefault 0 prefix (aliases clsState) + 1
+  put $ clsState { aliases = Map.insert prefix newIndex $ aliases clsState}
+  pure $ prefix <> Text.pack (show newIndex)
+
+addClauses :: H.QueryClauses -> QueryInner ()
+addClauses c = modify $ \clsState ->
+  clsState { clausesBuild = clausesBuild clsState <> c }
+
+from :: Table table database
+     -> Query database (Tbl table database 'InnerJoined)
+from (Table tableName) = Query $
+  do alias <- newAlias (Text.take 1 tableName)
+     addClauses $ H.from $ H.rawSql tableName `H.as` H.rawSql alias
+     pure $ mkTableAlias alias
+
+innerJoin :: Table table database
+          -> (Tbl table database 'InnerJoined ->
+              Expression nullable Bool)
+          -> Query database (Tbl table database 'InnerJoined)
+innerJoin (Table tableName) joinCondition = Query $ do
+  alias <- newAlias (Text.take 1 tableName)
+  let tblAlias = mkTableAlias alias
+  exprBuilder <- runExpression $ joinCondition tblAlias
+  addClauses $
+    H.innerJoin [H.rawSql tableName `H.as` H.rawSql alias] [exprBuilder]
+  pure tblAlias
+
+leftJoin :: Table table database
+         -> (Tbl table database 'LeftJoined ->
+             Expression nullable Bool)
+         -> Query database (Tbl table database 'LeftJoined)
+leftJoin (Table tableName) joinCondition = Query $ do
+  alias <- newAlias (Text.take 1 tableName)
+  let tblAlias = mkTableAlias alias
+  exprBuilder <- runExpression $ joinCondition tblAlias
+  addClauses $
+    H.leftJoin [H.rawSql tableName `H.as` H.rawSql alias] [exprBuilder]
+  pure tblAlias
+
+
+class SubQueryExpr (joinType :: JoinType) inExpr outExpr where
+  -- The ReaderT monad takes the alias of the subquery table.
+  -- The State monad uses the index of the last expression in the select clause.
+  -- It generates SELECT clause expressions with aliases e1, e2, ...
+  -- The outExpr contains just the output aliases.
+  -- input and output should be product types, and have the same number of
+  -- elements.
+  subJoinGeneric :: Proxy joinType
+                 -> inExpr
+                 -> ReaderT Text (State Int)
+                    (DList.DList SomeExpression, outExpr)
+
+instance ( SubQueryExpr joinType (a ()) (c ())
+         , SubQueryExpr joinType (b ()) (d ())) =>
+         SubQueryExpr joinType ((a :*: b) ()) ((c :*: d) ()) where
+  subJoinGeneric p (l :*: r) = do
+    (lftBuilder, outLft) <- subJoinGeneric p l
+    (rtBuilder, outRt) <- subJoinGeneric p r
+    pure (lftBuilder <> rtBuilder, outLft :*: outRt)
+          
+instance SubQueryExpr joinType (a ()) (b ()) =>
+         SubQueryExpr joinType (M1 m1 m2 a ()) (M1 m3 m4 b ()) where
+  subJoinGeneric p (M1 x) = fmap M1 <$> subJoinGeneric p x
+    
+instance JoinNullable joinType nullable ~ nullable2 => 
+         SubQueryExpr
+         joinType
+         (K1 r (Expression nullable a) ())
+         (K1 r (Expression nullable2 b) ())
+  where
+  subJoinGeneric _ (K1 (Expression exprBuilder)) =
+    ReaderT $ \alias -> state $ \i ->
+    let name = Text.pack ('e': show i)
+    in ( ( DList.singleton $ SomeExpression $
+           (`H.as` H.rawSql name) <$> exprBuilder
+         , K1 $ Expression $ pure $ H.rawSql $ alias <> "." <> name)
+       , i+1
+       )
+
+-- update the aliases, but create and return new query clauses
+runAsSubQuery :: Query database a -> QueryInner (H.QueryClauses, a)
+runAsSubQuery (Query sq) =
+  do ClauseState currentClauses currentAliases <- get
+     let (subQueryRet, ClauseState subQueryBody newAliases) =
+           runState sq (ClauseState mempty currentAliases)
+     put $ ClauseState currentClauses newAliases
+     pure (subQueryBody, subQueryRet)
+
+subQueryExpr :: Query database (Expression nullable a) -> Expression nullable a
+subQueryExpr sq = Expression $
+  do (subQueryBody, Expression subQuerySelect) <- runAsSubQuery sq 
+     selectBuilder <- subQuerySelect
+     pure $ H.subQuery $ H.select (H.values_ [selectBuilder]) subQueryBody
+
+-- 
+subJoinBody :: (Generic inExprs,
+              Generic outExprs,
+              SubQueryExpr joinType (Rep inExprs ()) (Rep outExprs ()))
+            => Proxy joinType
+            -> Query database inExprs
+            -> QueryInner (H.QueryBuilder, outExprs)
+subJoinBody p sq = do
+  sqAlias <- newAlias "sq"
+  (subQueryBody, sqExprs) <- runAsSubQuery sq
+  let from' :: Generic inExprs => inExprs -> Rep inExprs ()
+      from' = Generics.from
+      to' :: Generic outExpr => Rep outExpr () -> outExpr
+      to' = Generics.to
+      (selectExprs, outExprRep) = flip evalState 1 $
+                                  flip runReaderT sqAlias $
+                                  subJoinGeneric p $
+                                  from' sqExprs
+      outExpr = to' outExprRep
+  selectBuilder <- DList.toList <$> traverse runSomeExpression selectExprs
+  pure ( H.subQuery $ H.select (H.values_ selectBuilder) subQueryBody
+       , outExpr)
+
+joinSubQuery :: (Generic inExprs,
+                 Generic outExprs,
+                 SubQueryExpr 'InnerJoined (Rep inExprs ()) (Rep outExprs ()))
+             => Query database inExprs
+             -> (outExprs -> Expression nullable Bool)
+             -> Query database outExprs
+joinSubQuery sq condition = Query $ do
+  (subQueryBody, outExpr) <- subJoinBody (Proxy :: Proxy 'InnerJoined) sq 
+  conditionBuilder <- runExpression $ condition outExpr
+  addClauses $ H.innerJoin [subQueryBody] [conditionBuilder]
+  pure outExpr
+
+leftJoinSubQuery :: (Generic inExprs,
+                     Generic outExprs,
+                     SubQueryExpr 'LeftJoined (Rep inExprs ()) (Rep outExprs ()))
+                 => Query database inExprs
+                 -> (outExprs -> Expression nullable Bool)
+            -> Query database outExprs
+leftJoinSubQuery sq condition = Query $ do
+  (subQueryBody, outExpr) <- subJoinBody (Proxy :: Proxy 'LeftJoined) sq 
+  conditionBuilder <- runExpression $ condition outExpr
+  addClauses $ H.leftJoin [subQueryBody] [conditionBuilder]
+  pure outExpr
+
+fromSubQuery :: (Generic inExprs,
+                 Generic outExprs,
+                 SubQueryExpr 'LeftJoined (Rep inExprs ()) (Rep outExprs ()))
+             => Query database inExprs
+             -> Query database outExprs
+fromSubQuery sq = Query $ do              
+  (subQueryBody, outExpr) <- subJoinBody (Proxy :: Proxy 'LeftJoined) sq 
+  addClauses $ H.from subQueryBody
+  pure outExpr
+
+where_ :: Expression nullable Bool -> Query database ()
+where_ expr = Query $ do
+  exprBuilder <- runExpression expr
+  addClauses $ H.where_ [exprBuilder]
+
+groupBy_ :: [SomeExpression] -> Query database ()
+groupBy_ columns = Query $ do
+  columnBuilders <- traverse runSomeExpression columns
+  addClauses $ H.groupBy_ columnBuilders
+
+having :: Expression nullable Bool -> Query database ()
+having expr = Query $ do
+  exprBuilder <- runExpression expr
+  addClauses $ H.having [exprBuilder]
+
+orderBy :: [QueryOrdering] -> Query database ()
+orderBy ordering = Query $
+  do newOrdering <- traverse orderingToH ordering
+     addClauses $ H.orderBy newOrdering
+  where orderingToH (Asc x) = H.Asc <$> runSomeExpression x
+        orderingToH (Desc x) = H.Desc <$> runSomeExpression x
+
+limit :: Int -> Query database ()
+limit count = Query $ addClauses $ H.limit count
+
+limitOffset :: Int -> Int -> Query database ()
+limitOffset count offset = Query $ addClauses $ H.limitOffset count offset
+
+newtype Into database table =
+  Into { runInto :: QueryInner (Text, H.QueryBuilder) }
+
+exprInto :: CheckExprNullable exprNullable fieldNullable
+         => Expression exprNullable a ->
+            Field table database fieldNullable a ->
+            Into database table
+exprInto expr (Field _ fieldName) =
+  Into $ (fieldName,) <$> runExpression expr
+
+insertSelect :: Table table database
+             -> Query database [Into database table]
+             -> H.Command
+insertSelect (Table tbl) (Query query) =
+  H.insertSelect (H.rawSql tbl) (map (H.rawSql . fst) intos)
+  (map snd intos) clauses
+  where (intos, ClauseState clauses _) =
+          runState (query >>= traverse runInto) emptyClauseState
+

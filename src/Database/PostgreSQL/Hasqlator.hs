@@ -8,6 +8,8 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 {-|
 Module      : Database.Hasqelator
@@ -27,20 +29,20 @@ module Database.PostgreSQL.Hasqlator
 
     -- * Query Clauses
     QueryClauses, from, innerJoin, leftJoin, rightJoin, outerJoin, emptyJoins,
-    where_, emptyWhere, groupBy_, having, emptyHaving, orderBy, limit,
-    limitOffset,
+    where_, emptyWhere, groupBy_, having, emptyHaving, QueryOrdering(..),
+    orderBy, limit, limitOffset,
 
     -- * Selectors
     Selector, as,
 
     -- ** polymorphic selector
-    col,
+    sel,
     -- ** specialised selectors
-    -- | The following are specialised versions of `col`.  Using these
+    -- | The following are specialised versions of `sel`.  Using these
     -- may make refactoring easier, for example accidently swapping
-    -- @`col` "age"@ and @`col` "name"@ would not give a type error,
-    -- while @intCol "age"@ and @textCol "name"@ most likely would.
-    intCol, doubleCol, floatCol, 
+    -- @`sel` "age"@ and @`sel` "name"@ would not give a type error,
+    -- while @intSel "age"@ and @textSel "name"@ most likely would.
+    intSel, doubleSel, floatSel, 
 
     -- ** other selectors
     values_,
@@ -51,8 +53,8 @@ module Database.PostgreSQL.Hasqlator
     (/=.), (&&.), (||.), abs_, negate_, signum_, sum_, rawSql,
 
     -- * Insertion
-    Insertor, insertValues, insertSelect, into, Getter, lensInto,
-    insertOne, ToSql,
+    Insertor, insertValues, insertSelect, insertData, skipInsert, into, Getter,
+    lensInto, insertOne, ToSql,
     
     -- * Rendering Queries
     renderQuery, SQLError(..), QueryBuilder, ToQueryBuilder(..),
@@ -73,6 +75,8 @@ import Data.String hiding (unwords)
 import Data.List hiding (unwords)
 import qualified Data.DList as DList
 import Data.Proxy
+import GHC.Generics hiding (Selector, from)
+import qualified GHC.Generics as Generics (from)
 
 import Database.PostgreSQL.LibPQ
 import qualified PostgreSQL.Binary.Decoding as Decoding
@@ -98,7 +102,7 @@ toSqlValue :: forall a.ToSql a => a -> Maybe (Oid, StrictBS.ByteString)
 toSqlValue a = (toOid (Proxy :: Proxy a),) <$> toSqlByteString a
 
 instance FromSql a => IsString (Selector a) where
-  fromString = col . fromString
+  fromString = sel . fromString
 
 class ToQueryBuilder a where
   toQueryBuilder :: a -> QueryBuilder
@@ -126,23 +130,23 @@ selectOne f fieldName =
 
 -- | The polymorphic selector.  The return type is determined by type
 -- inference.
-col :: FromSql a => QueryBuilder -> Selector a
-col = selectOne fromSql
+sel :: FromSql a => QueryBuilder -> Selector a
+sel = selectOne fromSql
 
 -- | an integer field (TINYINT.. BIGINT).  Any bounded haskell integer
 -- type can be used here , for example `Int`, `Int32`, `Word32`.  An
 -- `Overflow` ur `Underflow` error will be raised if the value doesn't
 -- fit the type.
-intCol :: (Show a, Bounded a, Integral a) => QueryBuilder -> Selector a
-intCol = selectOne intFromSql
+intSel :: (Show a, Bounded a, Integral a) => QueryBuilder -> Selector a
+intSel = selectOne intFromSql
 
 -- | a DOUBLE field.
-doubleCol :: QueryBuilder -> Selector Double
-doubleCol = col
+doubleSel :: QueryBuilder -> Selector Double
+doubleSel = sel
 
 -- | a FLOAT field.
-floatCol :: QueryBuilder -> Selector Float
-floatCol = col
+floatSel :: QueryBuilder -> Selector Float
+floatSel = sel
 
 data SQLError = SQLError Text
               | ResultSetCountError
@@ -184,8 +188,7 @@ data Command = Update QueryBuilder [(QueryBuilder, QueryBuilder)] QueryBody
 
 -- | An @`Insertor` a@ provides a mapping of parts of values of type
 -- @a@ to columns in the database.  Insertors can be combined using `<>`.
-data Insertor a =
-  Insertor [Text] (a -> DList QueryBuilder)
+data Insertor a = Insertor [Text] (a -> DList QueryBuilder)
 
 data Join = Join JoinType [QueryBuilder] [QueryBuilder]
 data JoinType = InnerJoin | LeftJoin | RightJoin | OuterJoin
@@ -390,9 +393,51 @@ insertOne :: forall a.ToSql a => Text -> Insertor a
 insertOne s = Insertor [s] (DList.singleton . arg)
 
 -- | insert a datastructure
+class InsertGeneric (fields :: *) (data_ :: *) where
+  insertDataGeneric :: fields -> Insertor data_
 
+genFst :: (a :*: b) () -> a ()
+genFst (a :*: _) = a
 
--- | `into` uses the given extractor function to map the part to a
+genSnd :: (a :*: b) () -> b ()
+genSnd (_ :*: b) = b
+
+instance (InsertGeneric (a ()) (c ()),
+          InsertGeneric (b ()) (d ())) =>
+  InsertGeneric ((a :*: b) ()) ((c :*: d) ()) where
+  insertDataGeneric (a :*: b) =
+    contramap genFst (insertDataGeneric a) <>
+    contramap genSnd (insertDataGeneric b)
+
+instance InsertGeneric (a ()) (b ()) =>
+  InsertGeneric (M1 m1 m2 a ()) (M1 m3 m4 b ()) where
+  insertDataGeneric = contramap unM1 . insertDataGeneric . unM1
+
+instance ToSql b => InsertGeneric (K1 r Text ()) (K1 r b ()) where
+  insertDataGeneric = contramap unK1 . insertOne . unK1
+
+instance InsertGeneric (K1 r (Insertor a) ()) (K1 r a ()) where
+  insertDataGeneric = contramap unK1 . unK1
+
+-- | `insertData` inserts a tuple or other product type into the given
+-- fields.  It uses generics to match the input to the fields. For
+-- example:
+--
+-- > insert "Person" (insertData ("name", "age"))
+-- >   [Person "Bart Simpson" 10, Person "Lisa Simpson" 8]
+
+insertData :: (Generic a, Generic b, InsertGeneric (Rep a ()) (Rep b ()))
+           => a -> Insertor b
+insertData = contramap from' . insertDataGeneric . from'
+  where from' :: Generic a => a -> Rep a ()
+        from' = Generics.from
+
+-- | skipInsert is mempty specialized to an Insertor.  It can be used
+-- to skip fields when using insertData.
+skipInsert :: Insertor a
+skipInsert = mempty
+
+-- | `into` uses the given accessor function to map the part to a
 -- field.  For example:
 --
 -- > insertValues "Person" (fst `into` "name" <> snd `into` "age")
